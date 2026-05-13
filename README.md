@@ -1,5 +1,7 @@
 # MySQL 表结构 MCP 服务使用说明
 
+![case](case.png)
+
 ## 1. 这是什么
 
 这是一个基于标准 MCP 协议的只读 MySQL 表结构服务。  
