@@ -499,14 +499,14 @@ public final class MySqlSchemaMcpServer {
 
         static Config load(String[] args) {
             String profile = resolveProfile(args);
-            Path file = resolveConfigFile(profile);
-            Map<String, Object> root = loadYaml(file);
+            ConfigSource configSource = resolveConfigSource(profile);
+            Map<String, Object> root = loadYaml(configSource);
             Map<String, Object> mysql = nestedMap(root, "mysql");
-            String host = requiredValue(mysql, "host", file);
-            String database = requiredValue(mysql, "database", file);
-            String username = requiredValue(mysql, "username", file);
-            String password = requiredValue(mysql, "password", file);
-            int port = intConfigValue(mysql.get("port"), 3306, file, "mysql.port");
+            String host = requiredValue(mysql, "host", configSource.description());
+            String database = requiredValue(mysql, "database", configSource.description());
+            String username = requiredValue(mysql, "username", configSource.description());
+            String password = requiredValue(mysql, "password", configSource.description());
+            int port = intConfigValue(mysql.get("port"), 3306, configSource.description(), "mysql.port");
             return new Config(host, port, database, username, password);
         }
 
@@ -528,14 +528,20 @@ public final class MySqlSchemaMcpServer {
             return inferProfileFromRuntimeArtifact();
         }
 
-        private static Path resolveConfigFile(String profile) {
+        private static ConfigSource resolveConfigSource(String profile) {
             for (Path candidate : candidateConfigFiles(profile)) {
                 if (Files.exists(candidate)) {
-                    return candidate;
+                    return ConfigSource.forFile(candidate);
                 }
             }
+            String resourceName = PROFILE_PREFIX + profile + PROFILE_SUFFIX;
+            InputStream resourceStream = MySqlSchemaMcpServer.class.getClassLoader().getResourceAsStream(resourceName);
+            if (resourceStream != null) {
+                return ConfigSource.forClasspathResource(resourceName, resourceStream);
+            }
             throw new IllegalStateException("Config file not found for profile '" + profile
-                    + "'. Tried: " + String.join(", ", candidateConfigFiles(profile).stream().map(Path::toString).toList()));
+                    + "'. Tried: " + String.join(", ", candidateConfigFiles(profile).stream().map(Path::toString).toList())
+                    + ", classpath:" + resourceName);
         }
 
         private static List<Path> candidateConfigFiles(String profile) {
@@ -587,16 +593,16 @@ public final class MySqlSchemaMcpServer {
         }
 
         @SuppressWarnings("unchecked")
-        private static Map<String, Object> loadYaml(Path file) {
+        private static Map<String, Object> loadYaml(ConfigSource configSource) {
             Yaml yaml = new Yaml();
-            try (InputStream in = Files.newInputStream(file)) {
+            try (InputStream in = configSource.openStream()) {
                 Object loaded = yaml.load(in);
                 if (!(loaded instanceof Map<?, ?> map)) {
-                    throw new IllegalStateException("Invalid yaml structure: " + file);
+                    throw new IllegalStateException("Invalid yaml structure: " + configSource.description());
                 }
                 return (Map<String, Object>) map;
             } catch (IOException ex) {
-                throw new IllegalStateException("Failed to read config file: " + file + ". " + ex.getMessage(), ex);
+                throw new IllegalStateException("Failed to read config file: " + configSource.description() + ". " + ex.getMessage(), ex);
             }
         }
 
@@ -609,23 +615,51 @@ public final class MySqlSchemaMcpServer {
             return (Map<String, Object>) map;
         }
 
-        private static String requiredValue(Map<String, Object> map, String key, Path file) {
+        private static String requiredValue(Map<String, Object> map, String key, String sourceDescription) {
             Object value = map.get(key);
             if (value == null || String.valueOf(value).isBlank()) {
-                throw new IllegalStateException("Missing config '" + "mysql." + key + "' in " + file);
+                throw new IllegalStateException("Missing config '" + "mysql." + key + "' in " + sourceDescription);
             }
             return String.valueOf(value).trim();
         }
 
-        private static int intConfigValue(Object value, int defaultValue, Path file, String key) {
+        private static int intConfigValue(Object value, int defaultValue, String sourceDescription, String key) {
             if (value == null) {
                 return defaultValue;
             }
             try {
                 return Integer.parseInt(String.valueOf(value).trim());
             } catch (NumberFormatException ex) {
-                throw new IllegalStateException("Invalid integer config '" + key + "' in " + file, ex);
+                throw new IllegalStateException("Invalid integer config '" + key + "' in " + sourceDescription, ex);
             }
+        }
+    }
+
+    private record ConfigSource(Path file, String resourceName, InputStream resourceStream) {
+
+        static ConfigSource forFile(Path file) {
+            return new ConfigSource(file, null, null);
+        }
+
+        static ConfigSource forClasspathResource(String resourceName, InputStream resourceStream) {
+            return new ConfigSource(null, resourceName, resourceStream);
+        }
+
+        InputStream openStream() throws IOException {
+            if (file != null) {
+                return Files.newInputStream(file);
+            }
+            if (resourceStream != null) {
+                return resourceStream;
+            }
+            throw new IllegalStateException("Config source is not readable");
+        }
+
+        String description() {
+            if (file != null) {
+                return file.toString();
+            }
+            return "classpath:" + resourceName;
         }
     }
 
