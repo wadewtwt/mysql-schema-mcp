@@ -7,8 +7,16 @@ import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.server.transport.StdioServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
+import org.yaml.snakeyaml.Yaml;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
@@ -19,6 +27,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -31,18 +40,16 @@ public final class MySqlSchemaMcpServer {
     private static final String TOOL_DESCRIBE_TABLE = "describe_table";
     private static final String TOOL_ENTITY_CONTEXT = "get_entity_context";
 
-    private static final String ENV_HOST = "MYSQL_MCP_HOST";
-    private static final String ENV_PORT = "MYSQL_MCP_PORT";
-    private static final String ENV_DATABASE = "MYSQL_MCP_DATABASE";
-    private static final String ENV_USERNAME = "MYSQL_MCP_USERNAME";
-    private static final String ENV_PASSWORD = "MYSQL_MCP_PASSWORD";
+    private static final String DEFAULT_PROFILE = "dev";
+    private static final String PROFILE_PREFIX = "application-";
+    private static final String PROFILE_SUFFIX = ".yml";
 
     private MySqlSchemaMcpServer() {
     }
 
     public static void main(String[] args) {
         try {
-            Config config = Config.fromEnvironment();
+            Config config = Config.load(args);
             StdioServerTransportProvider transportProvider =
                     new StdioServerTransportProvider(new JacksonMcpJsonMapper(new ObjectMapper()));
 
@@ -490,13 +497,17 @@ public final class MySqlSchemaMcpServer {
 
     private record Config(String host, int port, String database, String username, String password) {
 
-        static Config fromEnvironment() {
-            String host = requiredEnv(ENV_HOST);
-            String database = requiredEnv(ENV_DATABASE);
-            String username = requiredEnv(ENV_USERNAME);
-            String password = requiredEnv(ENV_PASSWORD);
-            String portText = System.getenv().getOrDefault(ENV_PORT, "3306");
-            return new Config(host, Integer.parseInt(portText), database, username, password);
+        static Config load(String[] args) {
+            String profile = resolveProfile(args);
+            Path file = resolveConfigFile(profile);
+            Map<String, Object> root = loadYaml(file);
+            Map<String, Object> mysql = nestedMap(root, "mysql");
+            String host = requiredValue(mysql, "host", file);
+            String database = requiredValue(mysql, "database", file);
+            String username = requiredValue(mysql, "username", file);
+            String password = requiredValue(mysql, "password", file);
+            int port = intConfigValue(mysql.get("port"), 3306, file, "mysql.port");
+            return new Config(host, port, database, username, password);
         }
 
         Connection openConnection() throws SQLException {
@@ -505,12 +516,116 @@ public final class MySqlSchemaMcpServer {
             return DriverManager.getConnection(url, username, password);
         }
 
-        private static String requiredEnv(String name) {
-            String value = System.getenv(name);
-            if (value == null || value.isBlank()) {
-                throw new IllegalStateException("Missing environment variable: " + name);
+        private static String resolveProfile(String[] args) {
+            if (args == null) {
+                return inferProfileFromRuntimeArtifact();
             }
-            return value.trim();
+            for (int i = 0; i < args.length; i++) {
+                if ("--profile".equals(args[i]) && i + 1 < args.length) {
+                    return args[i + 1].trim();
+                }
+            }
+            return inferProfileFromRuntimeArtifact();
+        }
+
+        private static Path resolveConfigFile(String profile) {
+            for (Path candidate : candidateConfigFiles(profile)) {
+                if (Files.exists(candidate)) {
+                    return candidate;
+                }
+            }
+            throw new IllegalStateException("Config file not found for profile '" + profile
+                    + "'. Tried: " + String.join(", ", candidateConfigFiles(profile).stream().map(Path::toString).toList()));
+        }
+
+        private static List<Path> candidateConfigFiles(String profile) {
+            List<Path> candidates = new ArrayList<>();
+            String fileName = PROFILE_PREFIX + profile + PROFILE_SUFFIX;
+            runtimeDirectory().ifPresent(dir -> candidates.add(dir.resolve(fileName).toAbsolutePath().normalize()));
+            candidates.add(Paths.get(fileName).toAbsolutePath().normalize());
+            candidates.add(Paths.get("src", "main", "resources", fileName).toAbsolutePath().normalize());
+            return candidates;
+        }
+
+        private static String inferProfileFromRuntimeArtifact() {
+            return runtimeArtifactName()
+                    .map(String::toLowerCase)
+                    .map(name -> {
+                        if (name.contains("-prod-")) {
+                            return "prod";
+                        }
+                        if (name.contains("-test-")) {
+                            return "test";
+                        }
+                        if (name.contains("-dev-")) {
+                            return "dev";
+                        }
+                        return DEFAULT_PROFILE;
+                    })
+                    .orElse(DEFAULT_PROFILE);
+        }
+
+        private static java.util.Optional<Path> runtimeDirectory() {
+            return runtimeArtifactPath().map(Path::getParent);
+        }
+
+        private static java.util.Optional<String> runtimeArtifactName() {
+            return runtimeArtifactPath().map(path -> path.getFileName().toString());
+        }
+
+        private static java.util.Optional<Path> runtimeArtifactPath() {
+            try {
+                URL location = MySqlSchemaMcpServer.class.getProtectionDomain().getCodeSource().getLocation();
+                if (location == null) {
+                    return java.util.Optional.empty();
+                }
+                Path path = Paths.get(location.toURI()).toAbsolutePath().normalize();
+                return java.util.Optional.of(path);
+            } catch (URISyntaxException | RuntimeException ex) {
+                return java.util.Optional.empty();
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> loadYaml(Path file) {
+            Yaml yaml = new Yaml();
+            try (InputStream in = Files.newInputStream(file)) {
+                Object loaded = yaml.load(in);
+                if (!(loaded instanceof Map<?, ?> map)) {
+                    throw new IllegalStateException("Invalid yaml structure: " + file);
+                }
+                return (Map<String, Object>) map;
+            } catch (IOException ex) {
+                throw new IllegalStateException("Failed to read config file: " + file + ". " + ex.getMessage(), ex);
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> nestedMap(Map<String, Object> root, String key) {
+            Object value = root.get(key);
+            if (!(value instanceof Map<?, ?> map)) {
+                return Collections.emptyMap();
+            }
+            return (Map<String, Object>) map;
+        }
+
+        private static String requiredValue(Map<String, Object> map, String key, Path file) {
+            Object value = map.get(key);
+            if (value == null || String.valueOf(value).isBlank()) {
+                throw new IllegalStateException("Missing config '" + "mysql." + key + "' in " + file);
+            }
+            return String.valueOf(value).trim();
+        }
+
+        private static int intConfigValue(Object value, int defaultValue, Path file, String key) {
+            if (value == null) {
+                return defaultValue;
+            }
+            try {
+                return Integer.parseInt(String.valueOf(value).trim());
+            } catch (NumberFormatException ex) {
+                throw new IllegalStateException("Invalid integer config '" + key + "' in " + file, ex);
+            }
         }
     }
 
